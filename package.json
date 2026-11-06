@@ -1,30 +1,25 @@
 {
-  "name": "decky-plugin-template",
+  "name": "decky-dsr-fov",
   "version": "0.0.1",
-  "description": "A template to quickly create decky plugins from scratch, based on TypeScript and webpack",
+  "description": "Decky plugin for adjusting Dark Souls Remastered FOV.",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
+    "package": "scripts/build-plugin.sh",
+    "copy:deck": "scripts/copy-to-steamdeck.sh",
     "watch": "rollup -c -w",
     "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/SteamDeckHomebrew/decky-plugin-template.git"
   },
   "keywords": [
     "decky",
     "plugin",
-    "plugin-template",
+    "dark-souls-remastered",
+    "fov",
     "steam-deck",
     "deck"
   ],
-  "author": "You <you@you.tld>",
+  "author": "Joseph",
   "license": "BSD-3-Clause",
-  "bugs": {
-    "url": "https://github.com/SteamDeckHomebrew/decky-plugin-template/issues"
-  },
-  "homepage": "https://github.com/SteamDeckHomebrew/decky-plugin-template#readme",
   "devDependencies": {
     "@decky/rollup": "^1.0.2",
     "@decky/ui": "^4.11.0",

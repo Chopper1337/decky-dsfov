@@ -1,14 +1,14 @@
-# This is the default target, which will be built when 
-# you invoke make
-.PHONY: all
-all: hello
+CC ?= cc
+CFLAGS ?= -Wall -Wextra -O2
+LDFLAGS ?=
 
-# This rule tells make how to build hello from hello.cpp
-hello:
+.PHONY: all clean
+
+all: dsr-fov-patcher
+
+dsr-fov-patcher:
 	mkdir -p ./out
-	gcc -o ./out/hello ./src/main.c 
+	$(CC) $(CFLAGS) -o ./out/dsr-fov-patcher ./src/dsr-fov-patcher.c $(LDFLAGS)
 
-# This rule tells make to delete hello and hello.o
-.PHONY: clean 
 clean:
-	rm -f hello
+	rm -f ./out/dsr-fov-patcher

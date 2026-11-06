@@ -2,114 +2,123 @@ import {
   ButtonItem,
   PanelSection,
   PanelSectionRow,
-  Navigation,
-  staticClasses
+  staticClasses,
 } from "@decky/ui";
-import {
-  addEventListener,
-  removeEventListener,
-  callable,
-  definePlugin,
-  toaster,
-  // routerHook
-} from "@decky/api"
-import { useState } from "react";
-import { FaShip } from "react-icons/fa";
+import { callable, definePlugin, toaster } from "@decky/api";
+import { useEffect, useState } from "react";
+import type { ChangeEvent } from "react";
+import { FaEye } from "react-icons/fa";
 
-// import logo from "../assets/logo.png";
-
-// This function calls the python function "add", which takes in two numbers and returns their sum (as a number)
-// Note the type annotations:
-//  the first one: [first: number, second: number] is for the arguments
-//  the second one: number is for the return value
-const add = callable<[first: number, second: number], number>("add");
-
-// This function calls the python function "start_timer", which takes in no arguments and returns nothing.
-// It starts a (python) timer which eventually emits the event 'timer_event'
-const startTimer = callable<[], void>("start_timer");
-
-function Content() {
-  const [result, setResult] = useState<number | undefined>();
-
-  const onClick = async () => {
-    const result = await add(Math.random(), Math.random());
-    setResult(result);
-  };
-
-  return (
-    <PanelSection title="Panel Section">
-      <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          onClick={onClick}
-        >
-          {result ?? "Add two numbers via Python"}
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          onClick={() => startTimer()}
-        >
-          {"Start Python timer"}
-        </ButtonItem>
-      </PanelSectionRow>
-
-      {/* <PanelSectionRow>
-        <div style={{ display: "flex", justifyContent: "center" }}>
-          <img src={logo} />
-        </div>
-      </PanelSectionRow> */}
-
-      {/*<PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          onClick={() => {
-            Navigation.Navigate("/decky-plugin-test");
-            Navigation.CloseSideMenus();
-          }}
-        >
-          Router
-        </ButtonItem>
-      </PanelSectionRow>*/}
-    </PanelSection>
-  );
+type PluginState = {
+  fov: number;
+  default_fov: number;
+  min_fov: number;
+  max_fov: number;
+  step: number;
+  game_running: boolean;
+  game_ready: boolean;
+  pid: number | null;
+  age_seconds: number;
+  wait_seconds: number;
+  busy: boolean;
+  pending: boolean;
+  message: string;
+  error: string;
 };
 
+const getState = callable<[], PluginState>("get_state");
+const setFov = callable<[fov: number], PluginState>("set_fov");
+const resetFov = callable<[], PluginState>("reset_fov");
+
+const formatFov = (value: number) => value.toFixed(2);
+
+function Content() {
+  const [state, setState] = useState<PluginState | undefined>();
+
+  const refreshState = async () => {
+    const nextState = await getState();
+    setState(nextState);
+  };
+
+  useEffect(() => {
+    refreshState();
+    const interval = window.setInterval(refreshState, 5000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  const updateState = (nextState: PluginState) => {
+    setState(nextState);
+    if (nextState.error) {
+      toaster.toast({
+        title: "FOV patch failed",
+        body: nextState.error,
+      });
+    }
+  };
+
+  const commitFov = async (value: number) => {
+    updateState(await setFov(value));
+  };
+
+  const onSliderChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const value = Number(event.currentTarget.value);
+    await commitFov(value);
+  };
+
+  const onReset = async () => {
+    updateState(await resetFov());
+  };
+
+  if (!state) {
+    return (
+      <PanelSection title="DSR FOV">
+        <PanelSectionRow>
+          <div>Loading...</div>
+        </PanelSectionRow>
+      </PanelSection>
+    );
+  }
+
+  return (
+    <PanelSection title="DSR FOV">
+      <PanelSectionRow>
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between" }}>
+            <span>FOV</span>
+            <span>{formatFov(state.fov)}</span>
+          </div>
+          <input
+            type="range"
+            min={state.min_fov}
+            max={state.max_fov}
+            step={state.step}
+            value={state.fov}
+            onChange={onSliderChange}
+            style={{ width: "100%" }}
+          />
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={onReset}>
+          Reset to Default
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+          <div>{state.message}</div>
+          {state.pid ? <div>PID: {state.pid}</div> : null}
+          {state.pending ? <div>Pending change queued.</div> : null}
+        </div>
+      </PanelSectionRow>
+    </PanelSection>
+  );
+}
+
 export default definePlugin(() => {
-  console.log("Template plugin initializing, this is called once on frontend startup")
-
-  // serverApi.routerHook.addRoute("/decky-plugin-test", DeckyPluginRouterTest, {
-  //   exact: true,
-  // });
-
-  // Add an event listener to the "timer_event" event from the backend
-  const listener = addEventListener<[
-    test1: string,
-    test2: boolean,
-    test3: number
-  ]>("timer_event", (test1, test2, test3) => {
-    console.log("Template got timer_event with:", test1, test2, test3)
-    toaster.toast({
-      title: "template got timer_event",
-      body: `${test1}, ${test2}, ${test3}`
-    });
-  });
-
   return {
-    // The name shown in various decky menus
-    name: "Test Plugin",
-    // The element displayed at the top of your plugin's menu
-    titleView: <div className={staticClasses.Title}>Decky Example Plugin</div>,
-    // The content of your plugin's menu
+    name: "DSR FOV",
+    titleView: <div className={staticClasses.Title}>DSR FOV</div>,
     content: <Content />,
-    // The icon displayed in the plugin list
-    icon: <FaShip />,
-    // The function triggered when your plugin unloads
-    onDismount() {
-      console.log("Unloading")
-      removeEventListener("timer_event", listener);
-      // serverApi.routerHook.removeRoute("/decky-plugin-test");
-    },
+    icon: <FaEye />,
   };
 });
