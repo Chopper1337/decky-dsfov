@@ -281,7 +281,7 @@ class Plugin:
             self.last_message = self.last_error
             return
 
-        args = [patcher, "--pid", str(pid)]
+        args = [patcher]
         if action["kind"] == "restore":
             args.append("--restore")
         else:
@@ -300,7 +300,14 @@ class Plugin:
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
-            self.last_error = "FOV patcher timed out."
+            if (await self._game_status())["pid"] is None:
+                self.last_error = (
+                    "Dark Souls Remastered closed before the FOV could be applied."
+                )
+            else:
+                self.last_error = (
+                    "Timed out looking for the FOV patch site in game memory."
+                )
             self.last_message = self.last_error
             return
         except Exception as error:

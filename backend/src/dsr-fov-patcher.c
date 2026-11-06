@@ -30,6 +30,16 @@ enum {
     PATCH_FILE_OFFSET = 0x235306,
     PATCH_LEN = 6,
     STUB_LEN  = 13, /* mov eax,imm32 + mov r8,rdx + jmp rel32 */
+    HEADER_SIZE = 0x400,  /* SizeOfHeaders; the rest of the header page is zero padding */
+    PAGE_SIZE_BYTES = 0x1000,
+    WAIT_POLL_SECONDS = 1,
+    WAIT_TIMEOUT_SECONDS = 300,
+    /*
+     * The game's protection layer rewrites its code during startup, and a
+     * patch applied in the first second crashes the game. Patching after
+     * the game process has run this long is known to work.
+     */
+    MIN_GAME_AGE_SECONDS = 45,
 };
 
 struct map_range {
@@ -61,22 +71,48 @@ static bool is_number(const char *s) {
     return true;
 }
 
-static bool file_contains(const char *path, const char *needle) {
+/* The kernel truncates comm to 15 characters: "DarkSoulsRemastered.exe" becomes "DarkSoulsRemast". */
+static const char k_game_comm[] = "DarkSoulsRemast";
+static const char k_game_exe[] = "DarkSoulsRemastered.exe";
+
+static bool comm_equals(const char *pid_dir, const char *expected) {
+    char path[512];
+    snprintf(path, sizeof(path), "/proc/%s/comm", pid_dir);
     int fd = open(path, O_RDONLY);
     if (fd < 0)
         return false;
-    char buf[8192];
+    char buf[64];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n <= 0)
         return false;
     buf[n] = 0;
-    for (ssize_t i = 0; i < n; i++)
-        if (buf[i] == 0)
-            buf[i] = ' ';
-    return strstr(buf, needle) != NULL;
+    buf[strcspn(buf, "\n")] = 0;
+    return strcmp(buf, expected) == 0;
 }
 
+/* True if the process maps a file whose basename is exactly `exe`.
+ * Launcher, Proton and Wine helper processes only mention the EXE in their
+ * command line; only the game process itself maps it. */
+static bool maps_module(const char *pid_dir, const char *exe) {
+    char path[512];
+    snprintf(path, sizeof(path), "/proc/%s/maps", pid_dir);
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return false;
+
+    bool found = false;
+    char line[4096 + 256];
+    while (!found && fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\n")] = 0;
+        const char *slash = strrchr(line, '/');
+        found = slash && strcmp(slash + 1, exe) == 0;
+    }
+    fclose(fp);
+    return found;
+}
+
+/* Returns the game's PID, or 0 if it is not running. Exits if several match. */
 static pid_t find_process(void) {
     DIR *dir = opendir("/proc");
     if (!dir)
@@ -88,18 +124,8 @@ static pid_t find_process(void) {
         if (!is_number(ent->d_name))
             continue;
 
-        char path[512];
-        snprintf(path, sizeof(path), "/proc/%s/comm", ent->d_name);
-        bool match = file_contains(path, "DarkSoulsRemast");
-        if (!match) {
-            snprintf(path, sizeof(path), "/proc/%s/cmdline", ent->d_name);
-            match = file_contains(path, "DarkSoulsRemastered.exe");
-        }
-        if (!match) {
-            snprintf(path, sizeof(path), "/proc/%s/maps", ent->d_name);
-            match = file_contains(path, "DarkSoulsRemastered.exe");
-        }
-        if (!match)
+        if (!comm_equals(ent->d_name, k_game_comm) ||
+            !maps_module(ent->d_name, k_game_exe))
             continue;
 
         pid_t pid = (pid_t)strtol(ent->d_name, NULL, 10);
@@ -112,10 +138,6 @@ static pid_t find_process(void) {
     }
 
     closedir(dir);
-    if (!found) {
-        fprintf(stderr, "DarkSoulsRemastered.exe process not found.\n");
-        exit(1);
-    }
     return found;
 }
 
@@ -124,7 +146,7 @@ static int read_maps(pid_t pid, struct map_range **out_maps) {
     snprintf(path, sizeof(path), "/proc/%d/maps", pid);
     FILE *fp = fopen(path, "r");
     if (!fp)
-        die("fopen maps");
+        return -1;
 
     int count = 0;
     int cap = 32;
@@ -245,16 +267,18 @@ static uintptr_t find_signature(int memfd, const struct map_range *maps, int cou
         if (!read_mem(memfd, m->start, buf, size))
             continue;
 
-        for (size_t off = 0; off + sizeof(k_fov_signature) <= size; off++) {
-            if (memcmp(buf + off, k_fov_signature, sizeof(k_fov_signature)) != 0)
-                continue;
-            uintptr_t addr = m->start + off;
+        const uint8_t *hit = buf;
+        size_t left = size;
+        while ((hit = memmem(hit, left, k_fov_signature, sizeof(k_fov_signature)))) {
+            uintptr_t addr = m->start + (uintptr_t)(hit - buf);
             if (found && found != addr) {
                 fprintf(stderr, "FOV signature is not unique; refusing to patch.\n");
                 free(buf);
                 exit(1);
             }
             found = addr;
+            hit++;
+            left = size - (size_t)(hit - buf);
         }
     }
 
@@ -304,8 +328,41 @@ static uintptr_t find_patch_addr(int memfd, const struct map_range *maps, int co
  * from patch_addr via a pair of rel32 jumps (±2 GB). The first qualifying
  * address is returned; 0 means no cave found.
  */
+/*
+ * Look for the stub location in the zero padding after the PE headers. The
+ * game keeps rewriting .text at runtime, so zero runs there are not safe.
+ */
+static uintptr_t find_header_cave(int memfd, const struct map_range *maps, int count,
+                                  uintptr_t patch_addr) {
+    uintptr_t base = patch_addr - PATCH_RVA;
+    uintptr_t start = base + HEADER_SIZE;
+    uintptr_t end = base + PAGE_SIZE_BYTES;
+
+    bool executable = false;
+    for (int i = 0; i < count; i++) {
+        if (maps[i].start <= start && end <= maps[i].end) {
+            executable = maps[i].perms[0] == 'r' && maps[i].perms[2] == 'x';
+            break;
+        }
+    }
+    if (!executable)
+        return 0;
+
+    uint8_t buf[PAGE_SIZE_BYTES - HEADER_SIZE];
+    if (!read_mem(memfd, start, buf, sizeof(buf)))
+        return 0;
+
+    static const uint8_t zeros[STUB_LEN] = {0};
+    const uint8_t *hit = memmem(buf, sizeof(buf), zeros, sizeof(zeros));
+    return hit ? start + (uintptr_t)(hit - buf) : 0;
+}
+
 static uintptr_t find_cave(int memfd, const struct map_range *maps, int count,
                            uintptr_t patch_addr) {
+    uintptr_t header_cave = find_header_cave(memfd, maps, count, patch_addr);
+    if (header_cave)
+        return header_cave;
+
     uint8_t *buf = NULL;
     size_t buf_cap = 0;
     uintptr_t found = 0;
@@ -354,6 +411,128 @@ static uintptr_t find_cave(int memfd, const struct map_range *maps, int count,
     return found;
 }
 
+/*
+ * True once the patch site holds either the original code or our jump.
+ * Reads memory without attaching, so polling does not stop the game.
+ */
+static bool patch_site_ready(pid_t pid) {
+    struct map_range *maps = NULL;
+    int count = read_maps(pid, &maps);
+    if (count < 0)
+        return false;
+
+    char mempath[64];
+    snprintf(mempath, sizeof(mempath), "/proc/%d/mem", pid);
+    int memfd = open(mempath, O_RDONLY);
+    if (memfd < 0) {
+        free(maps);
+        return false;
+    }
+
+    bool ready = false;
+    uintptr_t patch_addr = find_patch_addr(memfd, maps, count);
+    uint8_t current[PATCH_LEN];
+    if (patch_addr && read_mem(memfd, patch_addr, current, PATCH_LEN))
+        ready = memcmp(current, k_original_patch_bytes, PATCH_LEN) == 0 ||
+                current[0] == 0xe9;
+
+    close(memfd);
+    free(maps);
+    return ready;
+}
+
+/* Seconds since the process started, or -1 if it is gone. */
+static long process_age_seconds(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return -1;
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = 0;
+
+    /* comm may contain spaces; fields after it start at the last ')'. */
+    char *p = strrchr(buf, ')');
+    if (!p)
+        return -1;
+    unsigned long long start_ticks = 0;
+    if (sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu",
+               &start_ticks) != 1)
+        return -1;
+
+    double uptime = 0;
+    fp = fopen("/proc/uptime", "r");
+    if (!fp)
+        return -1;
+    int ok = fscanf(fp, "%lf", &uptime);
+    fclose(fp);
+    if (ok != 1)
+        return -1;
+
+    long ticks = sysconf(_SC_CLK_TCK);
+    long age = (long)(uptime - (double)start_ticks / (double)ticks);
+    return age < 0 ? 0 : age;
+}
+
+static bool process_exists(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d", pid);
+    return access(path, F_OK) == 0;
+}
+
+/*
+ * Wait until the game is running, has run for MIN_GAME_AGE_SECONDS, and its
+ * patch site is loaded. With pid 0 the game process is searched for;
+ * otherwise that PID must stay alive. Time spent waiting for the game to age
+ * does not count towards WAIT_TIMEOUT_SECONDS.
+ */
+static pid_t wait_for_patch_site(pid_t pid) {
+    bool announced = false;
+    pid_t announced_age = 0;
+    int waited = 0;
+    for (;;) {
+        if (pid && !process_exists(pid)) {
+            fprintf(stderr, "Process %d not found.\n", pid);
+            exit(1);
+        }
+        pid_t target = pid ? pid : find_process();
+
+        if (target) {
+            long age = process_age_seconds(target);
+            if (age >= 0 && age < MIN_GAME_AGE_SECONDS) {
+                if (announced_age != target) {
+                    printf("Found game (pid %d); patching in %ld s.\n",
+                           target, MIN_GAME_AGE_SECONDS - age);
+                    fflush(stdout);
+                    announced_age = target;
+                    announced = true;
+                }
+                sleep(WAIT_POLL_SECONDS);
+                continue;
+            }
+            if (age >= 0 && patch_site_ready(target))
+                return target;
+        }
+
+        if (waited >= WAIT_TIMEOUT_SECONDS) {
+            if (target)
+                fprintf(stderr, "Could not locate the FOV patch site in process memory.\n");
+            else
+                fprintf(stderr, "%s process not found.\n", k_game_exe);
+            exit(1);
+        }
+        if (!announced) {
+            printf("Waiting for Dark Souls Remastered... (Ctrl+C to cancel)\n");
+            fflush(stdout);
+            announced = true;
+        }
+        sleep(WAIT_POLL_SECONDS);
+        waited += WAIT_POLL_SECONDS;
+    }
+}
+
 static void attach_process(pid_t pid) {
     if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0)
         die("ptrace attach");
@@ -386,7 +565,10 @@ int main(int argc, char **argv) {
             restore = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("usage: %s [--pid PID] [--restore] [fov]\n", argv[0]);
-            printf("example: %s 1.08\n", argv[0]);
+            printf("example: %s 1.13\n", argv[0]);
+            printf("\nWaits up to %d s for the game to start, then patches it once the\n"
+                   "game has run for %d s.\n", WAIT_TIMEOUT_SECONDS, MIN_GAME_AGE_SECONDS);
+            printf("--restore does not wait.\n");
             return 0;
         } else {
             char *end = NULL;
@@ -398,8 +580,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!pid)
-        pid = find_process();
+    if (restore) {
+        if (!pid)
+            pid = find_process();
+        if (!pid) {
+            fprintf(stderr, "%s process not found.\n", k_game_exe);
+            return 1;
+        }
+    } else {
+        pid = wait_for_patch_site(pid);
+    }
 
     attach_process(pid);
 
@@ -415,6 +605,11 @@ int main(int argc, char **argv) {
 
     struct map_range *maps = NULL;
     int map_count = read_maps(pid, &maps);
+    if (map_count < 0) {
+        close(memfd);
+        detach_process(pid);
+        die("read maps");
+    }
 
     uintptr_t patch_addr = find_patch_addr(memfd, maps, map_count);
     if (!patch_addr) {
