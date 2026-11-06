@@ -2,8 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-ZIP_NAME="${ZIP_NAME:-DarkSoulsRemasteredFOV-v0.0.1.zip}"
-ZIP_PATH="${1:-$ROOT_DIR/out/$ZIP_NAME}"
+VERSION="$(cd "$ROOT_DIR" && node -p 'require("./package.json").version')"
+ZIP_NAME="${ZIP_NAME:-DarkSoulsRemasteredFOV-v$VERSION.zip}"
+ZIP_PATH="${1:-$ROOT_DIR/releases/$ZIP_NAME}"
 DECK_HOST="${DECK_HOST:-deck@steamdeck}"
 DECK_DEST_DIR="${DECK_DEST_DIR:-/home/deck/Downloads}"
 

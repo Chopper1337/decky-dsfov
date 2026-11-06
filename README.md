@@ -25,7 +25,9 @@ Install frontend dependencies:
 pnpm i
 ```
 
-Build the plugin zip:
+Build the release zip (`releases/DarkSoulsRemasteredFOV-v<version>.zip`, version from
+`package.json`). The patcher is linked statically (musl if `musl-gcc` is installed)
+so it runs on SteamOS regardless of the build host's glibc:
 
 ```sh
 scripts/build-plugin.sh
@@ -43,7 +45,7 @@ Copy the built zip to the Steam Deck:
 scripts/copy-to-steamdeck.sh
 ```
 
-By default this copies `out/DarkSoulsRemasteredFOV-v0.0.1.zip` to
+By default this copies `releases/DarkSoulsRemasteredFOV-v<version>.zip` to
 `deck@steamdeck:/home/deck/Downloads/`.
 
 Override the target if needed:
